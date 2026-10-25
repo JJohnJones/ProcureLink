@@ -53,7 +53,7 @@ export default function RegionMap({ cases, expanded = false, onCase }: { cases: 
         if (layer?.id === 'staff-locations') return { text: `${object.name}\n${object.location}` };
         if (layer?.id === 'assignment-routes') return { text: `${object.case.case_id} · ~${estimateEta(distanceKm(object.from, object.to))} min\nStraight-line estimate at 65 km/h` };
         return null;
-      }}><BaseMap mapStyle="/map-style.json" attributionControl={false} onError={() => setTilesError(true)} onIdle={() => setTilesError(false)} /></DeckGL>}
+      }}><BaseMap mapStyle={`${import.meta.env.BASE_URL}map-style.json`} attributionControl={false} onError={() => setTilesError(true)} onIdle={() => setTilesError(false)} /></DeckGL>}
     <div className="map-region-label"><span className="live-dot" />WESTERN OHIO<span className="map-live">LIVE COVERAGE</span></div>
     <div className="map-tools"><button title="Zoom in" aria-label="Zoom in" onClick={() => setView(v => ({ ...v, zoom: Math.min(14, v.zoom + .6) }))}><Plus size={16} /></button><button title="Zoom out" aria-label="Zoom out" onClick={() => setView(v => ({ ...v, zoom: Math.max(5, v.zoom - .6) }))}><Minus size={16} /></button><button title="Reset map" aria-label="Reset map" onClick={() => { setView(initial); setSelected(null); }}><Crosshair size={16} /></button></div>
     <div className="map-scale"><span style={{ width: scaleKm / kmPerPixel }} />{scaleKm >= 1 ? `${scaleKm} km` : `${Math.round(scaleKm * 1000)} m`}</div>
