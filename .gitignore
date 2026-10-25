@@ -1,0 +1,59 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+!.env.sample
+!.env.template
+*.local
+
+# JavaScript dependencies and generated builds
+node_modules/
+dist/
+build/
+.vite/
+*.tsbuildinfo
+
+# Browser tests and coverage
+playwright-report/
+playwright/.cache/
+test-results/
+coverage/
+htmlcov/
+.coverage
+.coverage.*
+
+# Python environments, caches, and packaging
+.venv*/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+*.egg-info/
+*.egg
+
+# Local datasets and generated model artifacts
+*.csv
+*.pkl
+*.pickle
+*.joblib
+*.ubj
+*.xgb
+
+# Logs, temporary files, and editor settings
+*.log
+*.pid
+*.tmp
+*.swp
+*.swo
+*~
+.cache/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

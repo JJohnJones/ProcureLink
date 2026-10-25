@@ -1,0 +1,5 @@
+# Install only into .venv-ai4free with Python 3.11.
+ai4free==0.7
+webscout==8.3.7
+g4f==8.8.6
+click>=8,<9
