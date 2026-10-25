@@ -1,7 +1,54 @@
 import { test, expect } from '@playwright/test';
 
+test('legacy brief refresh retries safely and other validation errors stay readable', async ({ page }) => {
+  const requests: { refresh?: boolean }[] = [];
+  const ids = Array.from({ length: 15 }, (_, index) => `OPC_${String(index + 1).padStart(2, '0')}`);
+  let invalidCase = false;
+  await page.route(/\/(health|output|cases\/brief)(\?.*)?$/, async route => {
+    const path = new URL(route.request().url()).pathname;
+    let status = 200;
+    let json;
+    if (path.endsWith('/health')) {
+      json = { status: 'ok', training_cases: 2500, authorization_rate: .65, opc_ids: ids, boosting_rounds: 100, models: [] };
+    } else if (path.endsWith('/output')) {
+      json = ids.map((opc_id, index) => ({ opc_id, probability: .85 - index * .02 }));
+    } else {
+      const request = route.request().postDataJSON();
+      requests.push(request);
+      if (invalidCase) {
+        status = 422;
+        json = { detail: [{ type: 'greater_than_equal', loc: ['body', 'case', 'age'], msg: 'Input should be greater than or equal to 0' }] };
+      } else if ('refresh' in request) {
+        status = 422;
+        json = { detail: [{ type: 'extra_forbidden', loc: ['body', 'refresh'], msg: 'Extra inputs are not permitted' }] };
+      } else {
+        json = { opc_id: request.opc_id, probability: .85, source: 'groq', source_detail: null,
+          case_brief: `Legacy brief generation ${requests.length}.`, match_rationale: 'Model associations are not causes.' };
+      }
+    }
+    await route.fulfill({ status, json, headers: { 'Access-Control-Allow-Origin': '*' } });
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Add case', exact: true }).click();
+  await page.getByRole('button', { name: 'Create referral', exact: true }).click();
+  await page.getByRole('button', { name: 'Generate brief', exact: true }).click();
+  await expect(page.locator('.case-brief-copy')).toHaveText('Legacy brief generation 1.');
+  expect(requests[0]).not.toHaveProperty('refresh');
+  await page.getByRole('button', { name: 'Refresh brief', exact: true }).click();
+  await expect(page.locator('.case-brief-copy')).toHaveText('Legacy brief generation 3.');
+  expect(requests[1].refresh).toBe(true);
+  expect(requests[2]).not.toHaveProperty('refresh');
+  await expect(page.locator('.case-brief-error')).toHaveCount(0);
+
+  invalidCase = true;
+  await page.getByRole('button', { name: 'Refresh brief', exact: true }).click();
+  await expect(page.locator('.case-brief-error')).toHaveText('case.age: Input should be greater than or equal to 0');
+  expect(requests).toHaveLength(4);
+  await expect(page.locator('body')).not.toContainText('[object Object]');
+});
+
 test('handoff displays actionable sections and refresh requests a fresh generation', async ({ page }) => {
-  const briefRequests: { refresh: boolean }[] = [];
+  const briefRequests: { refresh?: boolean }[] = [];
   const ids = Array.from({ length: 15 }, (_, index) => `OPC_${String(index + 1).padStart(2, '0')}`);
   await page.route(/\/(health|output|cases\/brief)(\?.*)?$/, async route => {
     const path = new URL(route.request().url()).pathname;
@@ -30,7 +77,7 @@ test('handoff displays actionable sections and refresh requests a fresh generati
   await expect(page.getByRole('heading', { name: 'Conversation priorities' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Confirm before approach' })).toBeVisible();
   await expect(page.locator('.case-brief-section li')).toHaveCount(3);
-  expect(briefRequests[0].refresh).toBe(false);
+  expect(briefRequests[0]).not.toHaveProperty('refresh');
   await page.getByRole('button', { name: 'Refresh brief', exact: true }).click();
   await expect.poll(() => briefRequests.length).toBe(2);
   expect(briefRequests[1].refresh).toBe(true);

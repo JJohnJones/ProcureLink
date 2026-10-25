@@ -1,4 +1,5 @@
 import type { CaseRecord, Staff } from "./types";
+import { ApiError, formatApiErrorDetail, isUnsupportedBriefRefresh } from "./apiErrors";
 
 const configuredApiOrigin = import.meta.env.VITE_API_BASE_URL?.trim().replace(
   /\/$/,
@@ -73,13 +74,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       response.status === 500
         ? "FastAPI encountered an internal error. Check the API terminal for its traceback."
         : `FastAPI returned HTTP ${response.status}.`;
+    let errorDetail: unknown;
     try {
-      const body = (await response.json()) as { detail?: string };
-      if (body.detail) detail = body.detail;
+      const body: unknown = await response.json();
+      if (body && typeof body === "object" && "detail" in body) {
+        errorDetail = body.detail;
+        detail = formatApiErrorDetail(errorDetail) || detail;
+      }
     } catch {
       /* The status line is enough when the server has no JSON body. */
     }
-    throw new Error(detail);
+    throw new ApiError(detail, response.status, errorDetail);
   }
   return response.json() as Promise<T>;
 }
@@ -160,27 +165,39 @@ export const api = {
       body: JSON.stringify(apiCase(record)),
     }),
 
-  caseBrief: (
+  caseBrief: async (
     record: CaseRecord,
     person: Staff,
     hospital: { name: string; city: string },
     distance_km: number,
     refresh = false,
-  ) =>
-    request<ApiCaseBrief>("/cases/brief", {
-      method: "POST",
-      body: JSON.stringify({
-        case: apiCase(record),
-        opc_id: person.modelId,
-        staff_name: person.name,
-        staff_location: person.location,
-        staff_specialty: person.specialty,
-        hospital_name: hospital.name,
-        hospital_city: hospital.city,
-        distance_km,
-        refresh,
-      }),
-    }),
+  ) => {
+    const payload = {
+      case: apiCase(record),
+      opc_id: person.modelId,
+      staff_name: person.name,
+      staff_location: person.location,
+      staff_specialty: person.specialty,
+      hospital_name: hospital.name,
+      hospital_city: hospital.city,
+      distance_km,
+      ...(refresh ? { refresh: true } : {}),
+    };
+    const generate = () => request<ApiCaseBrief>("/cases/brief", {
+      method: "POST", body: JSON.stringify(payload),
+    });
+    try {
+      return await generate();
+    } catch (error) {
+      // Older API deployments reject this optional field. Retry only that
+      // exact validation error; other case validation errors remain visible.
+      if (refresh && isUnsupportedBriefRefresh(error)) {
+        delete payload.refresh;
+        return generate();
+      }
+      throw error;
+    }
+  },
 
   trainOutcome: (
     record: CaseRecord,
