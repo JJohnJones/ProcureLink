@@ -1,30 +1,48 @@
 import pandas as pd
 import pytest
 import json
-import sys
-from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 import main
 
 
-def test_ai4free_bridge_uses_isolated_process_and_stdin(monkeypatch):
-    monkeypatch.setenv("GROQ_API_KEY", "test-key-never-in-arguments")
-    monkeypatch.setenv("AI4FREE_PYTHON", sys.executable)
+def test_ai4free_request_passes_prompt_without_credentials(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test-key-never-in-payload")
     calls = []
 
-    def worker(command, **kwargs):
-        calls.append((command, kwargs))
-        return SimpleNamespace(returncode=0, stdout=json.dumps({"ok": True, "content": "brief"}))
+    def worker(payload):
+        calls.append(payload)
+        return {"ok": True, "content": "brief"}
 
-    monkeypatch.setattr(main.subprocess, "run", worker)
+    monkeypatch.setattr(main.ai4free_bridge, "request", worker)
     assert main._groq_chat("fictional case") == "brief"
-    command, options = calls[0]
-    assert command[0] == sys.executable
-    assert command[1].endswith("ai4free_worker.py")
-    assert "test-key-never-in-arguments" not in str(command)
-    assert json.loads(options["input"])["prompt"] == "fictional case"
-    assert options["timeout"] == 28
+    assert calls[0]["action"] == "chat"
+    assert calls[0]["prompt"] == "fictional case"
+    assert "test-key-never-in-payload" not in json.dumps(calls[0])
+
+
+GENERATED = {
+    "case_overview": (
+        "This fictional referral concerns a 45-year-old patient at Miami Valley Hospital with anoxic injury and a recorded DBD pathway. "
+        "Registry status is not registered, and the documented family emotional state should guide the pace of the initial conversation. "
+        "Do not assume that this recorded label establishes understanding or readiness."
+    ),
+    "approach_context": (
+        "Before approaching the family, coordinate with the bedside team about prior discussions, who should be present, and the questions "
+        "the family wants addressed. Confirm the preferred language and any interpreter needs rather than treating the absence of recorded "
+        "interpreter use as evidence that language support is unnecessary."
+    ),
+    "conversation_priorities": ["Check what the family understands about the documented injury.", "Ask whether the family wants more information now."],
+    "verify_before_approach": ["Confirm preferred language and any interpreter support needed."],
+}
+
+
+def test_handoff_validation_discards_empty_model_bullets():
+    generated = main.GeneratedBrief.model_validate({
+        **GENERATED,
+        "conversation_priorities": [*GENERATED["conversation_priorities"], " ", ""],
+    })
+    assert generated.conversation_priorities == GENERATED["conversation_priorities"]
 
 
 def test_ai4free_status_reports_worker_failure_without_leaking_key(models, monkeypatch):
@@ -50,21 +68,76 @@ def test_case_brief_uses_ai4free_result_and_labels_failed_generation(models, fea
         "hospital_name": "Miami Valley", "hospital_city": "Dayton", "distance_km": 5,
     }
     monkeypatch.setattr(main, "_ai4free_request", lambda *args: {
-        "ok": True, "content": json.dumps({"case_brief": "Fictional case brief.", "match_rationale": "Model estimate."}),
+        "ok": True, "content": json.dumps(GENERATED),
     })
     with TestClient(main.create_app(models)) as client:
         brief = client.post("/cases/brief", json=request).json()
         assert brief["source"] == "groq"
-        assert brief["case_brief"] == "Fictional case brief."
+        assert brief["case_brief"] == GENERATED["case_overview"] + "\n\n" + GENERATED["approach_context"]
+        assert "not causes" in brief["match_rationale"]
+        assert brief["conversation_priorities"] == GENERATED["conversation_priorities"]
 
         def fail(*args):
             raise RuntimeError("AI4Free: Groq returned HTTP 403: No JSON error was returned.")
 
         monkeypatch.setattr(main, "_ai4free_request", fail)
-        fallback = client.post("/cases/brief", json=request).json()
+        fallback = client.post("/cases/brief", json={**request, "refresh": True}).json()
         assert fallback["source"] == "local_fallback"
         assert "No JSON error" in fallback["source_detail"]
         assert "Enable the model" not in fallback["source_detail"]
+
+
+def test_brief_cache_refresh_and_training_invalidation(models, features, monkeypatch):
+    calls = []
+
+    def generate(*args):
+        calls.append(args)
+        return {"ok": True, "content": json.dumps(GENERATED)}
+
+    monkeypatch.setattr(main, "_ai4free_request", generate)
+    request = {
+        "case": features, "opc_id": "OPC_01", "staff_name": "Demo Staff",
+        "staff_location": "Dayton", "staff_specialty": "Family support",
+        "hospital_name": "Miami Valley", "hospital_city": "Dayton", "distance_km": 5,
+    }
+    with TestClient(main.create_app(models)) as client:
+        assert client.post("/cases/brief", json=request).json()["cached"] is False
+        assert client.post("/cases/brief", json=request).json()["cached"] is True
+        assert len(calls) == 1
+        assert client.post("/cases/brief", json={**request, "refresh": True}).json()["cached"] is False
+        assert len(calls) == 2
+        changed = {**request, "case": {**features, "medical_mistrust": True}}
+        assert client.post("/cases/brief", json=changed).json()["cached"] is False
+        assert len(calls) == 3
+        client.post("/opcs/OPC_01/cases", json={**features, "authorized": True})
+        assert client.post("/cases/brief", json=request).json()["cached"] is False
+        assert len(calls) == 4
+
+
+def test_one_sentence_and_failed_briefs_are_not_cached(models, features, monkeypatch):
+    request = {
+        "case": {**features, "medical_mistrust": True, "multiple_decision_makers": True},
+        "opc_id": "OPC_01", "staff_name": "Demo Staff", "staff_location": "Dayton",
+        "staff_specialty": "Family support", "hospital_name": "Miami Valley",
+        "hospital_city": "Dayton", "distance_km": 5,
+    }
+    calls = []
+
+    def generate(*args):
+        calls.append(args)
+        data = {**GENERATED, "case_overview": "This is a one-sentence restatement."} if len(calls) == 1 else GENERATED
+        return {"ok": True, "content": json.dumps(data)}
+
+    monkeypatch.setattr(main, "_ai4free_request", generate)
+    with TestClient(main.create_app(models)) as client:
+        first = client.post("/cases/brief", json=request).json()
+        assert first["source"] == "local_fallback"
+        assert len(first["conversation_priorities"]) >= 3
+        assert any("mistrust" in item.lower() for item in first["conversation_priorities"])
+        assert first["verify_before_approach"]
+        assert client.post("/cases/brief", json=request).json()["source"] == "groq"
+        assert client.post("/cases/brief", json=request).json()["cached"] is True
+        assert len(calls) == 2
 
 
 @pytest.fixture

@@ -1,5 +1,41 @@
 import { test, expect } from '@playwright/test';
 
+test('handoff displays actionable sections and refresh requests a fresh generation', async ({ page }) => {
+  const briefRequests: { refresh: boolean }[] = [];
+  const ids = Array.from({ length: 15 }, (_, index) => `OPC_${String(index + 1).padStart(2, '0')}`);
+  await page.route(/\/(health|output|cases\/brief)(\?.*)?$/, async route => {
+    const path = new URL(route.request().url()).pathname;
+    let json;
+    if (path.endsWith('/health')) {
+      json = { status: 'ok', training_cases: 2500, authorization_rate: .65, opc_ids: ids, boosting_rounds: 100,
+        models: ids.map(opc_id => ({ opc_id, training_cases: 160, authorization_rate: .65, boosting_rounds: 100 })) };
+    } else if (path.endsWith('/output')) {
+      json = ids.map((opc_id, index) => ({ opc_id, probability: .85 - index * .02 }));
+    } else {
+      const request = route.request().postDataJSON();
+      briefRequests.push(request);
+      json = { opc_id: request.opc_id, probability: .85, source: 'groq', source_detail: null, cached: false,
+        case_brief: 'This fictional referral needs a coordinated family conversation.\n\nConfirm what has already been discussed before introducing new information.',
+        match_rationale: 'The model estimate describes an association; it does not establish family consent.',
+        conversation_priorities: ['Ask which questions the family wants addressed.', 'Check understanding before introducing more information.'],
+        verify_before_approach: ['Confirm who should be present for the discussion.'] };
+    }
+    await route.fulfill({ json, headers: { 'Access-Control-Allow-Origin': '*' } });
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Add case', exact: true }).click();
+  await page.getByRole('button', { name: 'Create referral', exact: true }).click();
+  await page.getByRole('button', { name: 'Generate brief', exact: true }).click();
+  await expect(page.locator('.case-brief-copy p')).toHaveCount(2);
+  await expect(page.getByRole('heading', { name: 'Conversation priorities' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Confirm before approach' })).toBeVisible();
+  await expect(page.locator('.case-brief-section li')).toHaveCount(3);
+  expect(briefRequests[0].refresh).toBe(false);
+  await page.getByRole('button', { name: 'Refresh brief', exact: true }).click();
+  await expect.poll(() => briefRequests.length).toBe(2);
+  expect(briefRequests[1].refresh).toBe(true);
+});
+
 for (const staffBusy of [false, true]) {
   test(`completed referral reverts to active with staff ${staffBusy ? 'busy elsewhere' : 'available'}`, async ({ page }) => {
     await page.route('**/api/**', route => route.abort());

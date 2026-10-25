@@ -10,16 +10,19 @@ import os
 import json
 import asyncio
 import shlex
-import subprocess
-from collections import defaultdict
+import hashlib
+import time
+from collections import OrderedDict, defaultdict
 from pathlib import Path
 from threading import RLock
+
+from ai4free_bridge import AI4FreeBridge
 
 import pandas as pd
 import xgboost as xgb
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
 
@@ -51,29 +54,13 @@ _load_local_env()
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
 
 
+ai4free_bridge = AI4FreeBridge()
+
+
 def _ai4free_request(action: str, prompt: str = "") -> dict:
-    """Run the legacy AI4Free dependency in its separate Python environment."""
     if not os.environ.get("GROQ_API_KEY", "").strip():
         raise RuntimeError("GROQ_API_KEY is not configured in the FastAPI process.")
-    root = Path(__file__).resolve().parent
-    python = Path(os.environ.get("AI4FREE_PYTHON", str(root / ".venv-ai4free/bin/python")))
-    if not python.is_file():
-        raise RuntimeError("AI4Free environment is missing. Install requirements-ai4free.txt into .venv-ai4free.")
-    try:
-        result = subprocess.run(
-            [str(python), str(root / "ai4free_worker.py")],
-            input=json.dumps({"action": action, "model": GROQ_MODEL, "prompt": prompt}),
-            capture_output=True, text=True, timeout=28, check=False,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError("AI4Free request timed out. Try again.") from error
-    try:
-        payload = json.loads(result.stdout)
-    except (ValueError, TypeError) as error:
-        raise RuntimeError("AI4Free worker failed to start or returned invalid output. Check its environment.") from error
-    if result.returncode or not payload.get("ok"):
-        raise RuntimeError(payload.get("error", "AI4Free worker failed."))
-    return payload
+    return ai4free_bridge.request({"action": action, "model": GROQ_MODEL, "prompt": prompt})
 
 
 def _groq_chat(prompt: str) -> str:
@@ -154,6 +141,32 @@ class CaseBriefRequest(BaseModel):
     hospital_name: str = Field(min_length=1)
     hospital_city: str = Field(min_length=1)
     distance_km: float = Field(ge=0, le=1000)
+    refresh: bool = False
+
+
+class GeneratedBrief(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    case_overview: str = Field(min_length=100, max_length=1200)
+    approach_context: str = Field(min_length=100, max_length=1200)
+    conversation_priorities: list[str] = Field(min_length=2, max_length=4)
+    verify_before_approach: list[str] = Field(min_length=1, max_length=3)
+
+    @field_validator("conversation_priorities", "verify_before_approach", mode="before")
+    @classmethod
+    def clean_handoff_items(cls, value, info):
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
+            limit = 4 if info.field_name == "conversation_priorities" else 3
+            return [item.strip() for item in value if item.strip()][:limit]
+        return value
+
+    @model_validator(mode="after")
+    def substantive_brief(self):
+        if len((self.case_overview + " " + self.approach_context).split()) < 60:
+            raise ValueError("Brief must synthesize the case in at least 60 words.")
+        for item in self.conversation_priorities + self.verify_before_approach:
+            if not item.strip() or len(item) > 500:
+                raise ValueError("Handoff items must be nonempty and concise.")
+        return self
 
 
 class CaseBrief(BaseModel):
@@ -161,8 +174,11 @@ class CaseBrief(BaseModel):
     probability: float
     case_brief: str
     match_rationale: str
+    conversation_priorities: list[str] = Field(default_factory=list)
+    verify_before_approach: list[str] = Field(default_factory=list)
     source: str
     source_detail: str | None = None
+    cached: bool = False
 
 
 class OPCModels:
@@ -385,10 +401,51 @@ def add_case(
 
 
 def create_app(models: OPCModels | None = None) -> FastAPI:
+    brief_cache = OrderedDict()
+    brief_pending = {}
+
+    async def generate_brief(prompt, refresh):
+        key = hashlib.sha256((GROQ_MODEL + prompt).encode()).hexdigest()
+        if not refresh and key in brief_cache:
+            expires, generated = brief_cache[key]
+            if time.monotonic() < expires:
+                brief_cache.move_to_end(key)
+                return generated, True
+            del brief_cache[key]
+
+        async def produce():
+            try:
+                raw = await asyncio.wait_for(asyncio.to_thread(_groq_chat, prompt), timeout=30)
+                if raw.startswith("```"):
+                    raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+                generated = GeneratedBrief.model_validate_json(raw).model_dump()
+                brief_cache[key] = (time.monotonic() + 600, generated)
+                brief_cache.move_to_end(key)
+                while len(brief_cache) > 64:
+                    brief_cache.popitem(last=False)
+                return generated
+            finally:
+                brief_pending.pop(key, None)
+
+        if key not in brief_pending:
+            brief_pending[key] = asyncio.create_task(produce())
+        return await asyncio.shield(brief_pending[key]), False
+
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         application.state.models = models if models is not None else get_models()
-        yield
+        if models is None and os.environ.get("GROQ_API_KEY", "").strip():
+            try:
+                await asyncio.to_thread(_ai4free_request, "warm")
+            except Exception:
+                pass  # Prediction remains available if the optional LLM cannot start.
+        try:
+            yield
+        finally:
+            for task in list(brief_pending.values()):
+                task.cancel()
+            await asyncio.gather(*list(brief_pending.values()), return_exceptions=True)
+            await asyncio.to_thread(ai4free_bridge.close)
 
     api = FastAPI(title="OPC Authorization Models", version="1.0.0", lifespan=lifespan)
     configured_origins = [
@@ -469,42 +526,83 @@ def create_app(models: OPCModels | None = None) -> FastAPI:
         except KeyError as error:
             raise HTTPException(status_code=404, detail=f"Unknown OPC ID: {request.opc_id}") from error
 
-        case_data = request.case.model_dump()
+        case = request.case
+        documented_concerns = [description for field, description in [
+            ("premature_donation_mention", "Donation was mentioned prematurely; clarify what was already discussed. This is about conversation timing, not the timing of death."),
+            ("multiple_decision_makers", "Multiple decision makers are flagged."),
+            ("family_estrangement", "Family estrangement is flagged."),
+            ("medical_mistrust", "Medical mistrust is flagged."),
+            ("patient_hemodynamically_unstable", "Hemodynamic instability is flagged; discussion timing requires coordination with the treating team."),
+            ("late_referral_rushing_withdrawal", "Late referral or rushed withdrawal timing is flagged; coordinate with the treating team."),
+        ] if getattr(case, field)]
+        case_data = {
+            "age_years": case.age,
+            "brain_death_record": "marked confirmed" if case.brain_death else "not marked confirmed",
+            "coded_cause_of_death": case.cause_of_death_unos,
+            "mechanism_recorded": case.mechanism_of_death,
+            "circumstances_recorded": case.circumstances_of_death,
+            "primary_etiology_recorded": case.primary_etiology,
+            "donation_pathway_recorded": case.donation_pathway,
+            "registry_status_recorded": case.registry_status,
+            "family_emotional_state_recorded": case.family_emotional_state,
+            "documented_concerns": documented_concerns,
+            "interpreter_record": "use is recorded; preferred language is unknown" if case.interpreter_utilized else "no use is recorded; language needs are unknown",
+        }
+        factors = explanation["factors"][:3]
+        factor_text = "; ".join(
+            f"{factor['feature'].replace('_', ' ')} is associated with a {('higher' if factor['contribution'] >= 0 else 'lower')} estimate"
+            for factor in factors
+        ) or "no feature contributions were available"
+        rationale = (
+            f"XGBoost estimates {explanation['probability']:.1%} authorization for {request.staff_name} with this fictional case. "
+            f"The strongest model associations are: {factor_text}. "
+            f"Staff are {request.distance_km:.1f} km from {request.hospital_name} in a straight line; this is not a driving-time estimate. "
+            "Model associations are not causes, staff qualifications, or evidence of family consent."
+        )
         prompt = (
-            "Write a concise handoff brief for an OPO coordinator and a separate short explanation of the selected staff match. "
-            "Use only facts in the supplied JSON. Do not infer missing clinical or family facts, recommend authorization, "
-            "or present model associations as causes. The match explanation must describe the supplied XGBoost probability, "
-            "the strongest supplied feature contributions, and straight-line distance; do not invent staff qualifications. "
-            "Return only a JSON object with string keys case_brief and match_rationale. Keep the case brief under 90 words "
-            "and the rationale under 45 words.\n\nINPUT JSON:\n"
+            "Prepare a practical handoff for an OPO coordinator using only the fictional record below. "
+            "Synthesize how the documented circumstances affect preparation for a family conversation; do not just list fields. "
+            "Return JSON with exactly four keys: "
+            "case_overview: a 40-60 word paragraph summarizing the referral and the most relevant documented concerns; "
+            "approach_context: a separate 50-80 word paragraph explaining how those concerns shape preparation and what is still unknown; "
+            "conversation_priorities: 2-4 concrete, case-specific discussion priorities, each tied to a recorded fact; "
+            "verify_before_approach: 1-3 important unknowns or coordination checks, explicitly phrased as things to confirm; "
+
+            "For mistrust, suggest inviting specific concerns and checking understanding. For multiple decision makers, suggest clarifying "
+            "who should participate and aligning information. For instability or rushed timing, suggest coordination with the treating team. "
+            "Make these preparation suggestions conditional, not claims about what the family thinks or what staff have already done. "
+            "Only listed concerns are documented. An absent concern does not prove its opposite. Interpreter use does not establish language needs. "
+            "Do not infer that coded death fields establish that death, testing, or recovery procedures have already occurred. "
+            "Unknown checks must be open questions, such as 'Confirm what has already been discussed', never 'Confirm the family has not been told'. "
+            "Do not speculate about motives, beliefs, willingness, or decision authority. Frame unknowns as questions for the team or family. "
+            "Registry status is a recorded fact; do not propose changing it or infer what it legally permits. "
+            "Do not discuss distance, logistics, prognosis, or model predictions in these paragraphs; the application supplies that separately. "
+            "Never infer readiness, preferences, or behavior from race, age, or gender. Do not invent dialogue, staff qualifications, clinical "
+            "prognosis, legal authority, treatment recommendations, or consent. Do not recommend pressure or a strategy to obtain authorization. "
+            "Separate recorded facts from suggestions and unknowns. Use plain language and do not include reasoning steps.\nINPUT JSON:\n"
             + json.dumps({
                 "case": case_data,
                 "hospital": {"name": request.hospital_name, "city": request.hospital_city},
-                "staff": {"name": request.staff_name, "location": request.staff_location, "specialty": request.staff_specialty},
-                "xgboost_match": {"authorization_probability": explanation["probability"], "top_feature_contributions": explanation["factors"]},
-                "straight_line_distance_km": request.distance_km,
+                "staff_name": request.staff_name,
+                "model_snapshot_version": hashlib.sha256(json.dumps(explanation, sort_keys=True).encode()).hexdigest(),
             }, ensure_ascii=False)
         )
         source = "groq"
         source_detail = None
+        cached = False
+        conversation_priorities = []
+        verify_before_approach = []
         try:
-            raw = await asyncio.wait_for(asyncio.to_thread(_groq_chat, prompt), timeout=30)
+            generated, cached = await generate_brief(prompt, request.refresh)
+            brief = generated["case_overview"] + "\n\n" + generated["approach_context"]
+            conversation_priorities = generated["conversation_priorities"]
+            verify_before_approach = generated["verify_before_approach"]
+        except ValueError:
+            source = "local_fallback"
+            source_detail = "Groq returned an incomplete handoff. Try Refresh brief."
         except Exception as error:
             source = "local_fallback"
             source_detail = _groq_failure_reason(error)
-        if source == "groq":
-            try:
-                # Some providers wrap otherwise valid JSON in a Markdown code fence.
-                if raw.startswith("```"):
-                    raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-                parsed = json.loads(raw)
-                brief = str(parsed["case_brief"]).strip()
-                rationale = str(parsed["match_rationale"]).strip()
-                if not brief or not rationale or len(brief) > 1200 or len(rationale) > 600:
-                    raise ValueError("Response fields are empty or too long.")
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                source = "local_fallback"
-                source_detail = "Groq responded, but its brief was not valid JSON. Try again."
         if source == "local_fallback":
             # Keep the workflow usable, while identifying non-LLM output.
             case = request.case
@@ -515,19 +613,36 @@ def create_app(models: OPCModels | None = None) -> FastAPI:
                 f"Donation pathway: {case.donation_pathway}; registry status: {registry_text}. "
                 f"Family emotional state is recorded as {case.family_emotional_state}."
             )
-            factors = explanation["factors"][:3]
-            factor_text = "; ".join(
-                f"{factor['feature'].replace('_', ' ')} is associated with a {('higher' if factor['contribution'] >= 0 else 'lower')} estimate"
-                for factor in factors
-            ) or "no feature contributions were available"
-            rationale = (
-                f"The model estimates {explanation['probability']:.1%} for {request.staff_name}. "
-                f"The strongest case associations are: {factor_text}. "
-                f"Straight-line distance is {request.distance_km:.1f} km. These are model associations, not causes."
+            brief += (
+                "\n\nBefore starting a discussion, check what the family has already been told and what questions they want addressed. "
+                "The record does not establish their understanding or readiness for a conversation. Use the documented concerns below "
+                "to prepare with the bedside team, and confirm missing details rather than assuming them."
             )
+            conversation_priorities = [
+                f"Family emotional state is recorded as {case.family_emotional_state}. Ask what the family understands and whether they want further information now."
+            ]
+            for flag, priority in [
+                (case.medical_mistrust, "Medical mistrust is flagged. Invite specific concerns and check understanding before introducing more information."),
+                (case.multiple_decision_makers, "Multiple decision makers are flagged. Confirm who should participate and what information each person has received."),
+                (case.family_estrangement, "Family estrangement is flagged. Coordinate appropriate contacts with the bedside team before arranging a joint discussion."),
+                (case.premature_donation_mention, "Premature donation mention is flagged. Confirm what was previously said and address resulting questions without assuming consent."),
+            ]:
+                if flag:
+                    conversation_priorities.append(priority)
+            if len(conversation_priorities) == 1:
+                conversation_priorities.append("Use the recorded donation pathway and registry status to prepare an explanation, then confirm the family's questions rather than assuming understanding.")
+            conversation_priorities = conversation_priorities[:4]
+            verify_before_approach = [
+                "Confirm preferred language and whether interpreter support is needed; the utilization field alone does not establish language needs.",
+                "Confirm who will be present and what has already been communicated by the treating team.",
+            ]
+            if case.patient_hemodynamically_unstable or case.late_referral_rushing_withdrawal:
+                verify_before_approach.insert(0, "Instability or rushed withdrawal timing is flagged. Coordinate an appropriate discussion time with the treating team.")
         return {"opc_id": request.opc_id, "probability": explanation["probability"],
                 "case_brief": brief, "match_rationale": rationale, "source": source,
-                "source_detail": source_detail}
+                "conversation_priorities": conversation_priorities,
+                "verify_before_approach": verify_before_approach,
+                "source_detail": source_detail, "cached": cached}
 
     @api.post("/opcs/{opc_id}/cases", response_model=TrainingResult, status_code=201)
     def train_case(

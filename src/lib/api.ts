@@ -45,6 +45,9 @@ export interface ApiCaseBrief {
   probability: number;
   case_brief: string;
   match_rationale: string;
+  conversation_priorities: string[];
+  verify_before_approach: string[];
+  cached: boolean;
   source: "groq" | "local_fallback";
   source_detail: string | null;
 }
@@ -162,6 +165,7 @@ export const api = {
     person: Staff,
     hospital: { name: string; city: string },
     distance_km: number,
+    refresh = false,
   ) =>
     request<ApiCaseBrief>("/cases/brief", {
       method: "POST",
@@ -174,6 +178,7 @@ export const api = {
         hospital_name: hospital.name,
         hospital_city: hospital.city,
         distance_km,
+        refresh,
       }),
     }),
 

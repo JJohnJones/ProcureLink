@@ -329,6 +329,11 @@ input[type=checkbox] { width: 13px; height: 13px; accent-color: #46d3a6; cursor:
 .case-brief-heading strong { font-size: 10px; font-weight: 500; }
 .case-brief-heading .button { flex-shrink: 0; }
 .case-brief-copy { color: #b7c6be; font-size: 10px; line-height: 1.7; margin-top: 11px; }
+.case-brief-copy p + p { margin-top: 9px; }
+.case-brief-section { margin-top: 12px; }
+.case-brief-section h4 { color: #a9c6b9; font-size: 9px; font-weight: 500; }
+.case-brief-section ul { padding-left: 15px; margin: 6px 0 0; color: #a7b8ad; font-size: 10px; line-height: 1.65; }
+.case-brief-section li + li { margin-top: 5px; }
 .case-brief-rationale { margin-top: 10px; padding-top: 9px; border-top: 1px solid #2a3b32; }
 .case-brief-rationale > span { color: #71b99a; font-size: 8px; }
 .case-brief-rationale p, .case-brief-hint, .case-brief-error { color: #87968e; font-size: 9px; line-height: 1.6; margin-top: 5px; }

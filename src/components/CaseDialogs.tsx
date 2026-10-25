@@ -46,17 +46,18 @@ export function CaseDetailModal({ record, cases, outcomes, onClose, onAssign, on
   const closed = !isActive(record);
   const busy = (id: string) => cases.some(c => c.opc_id === id && isActive(c) && c.case_id !== record.case_id);
   const bestAvailable = ranked.find(s => !busy(s.id));
-  const briefTarget = current || bestAvailable;
+  const briefTarget = current ? ranked.find(person => person.id === current.id) : bestAvailable;
   useEffect(() => {
     briefRequestId.current += 1;
     setBrief(null); setBriefError(''); setBriefLoading(false);
-  }, [record.case_id, briefTarget?.id]);
+    return () => { briefRequestId.current += 1; };
+  }, [record, briefTarget?.id, briefTarget?.probability]);
   async function generateBrief() {
     if (!briefTarget || briefLoading) return;
     const requestId = ++briefRequestId.current;
     setBriefLoading(true); setBriefError('');
     try {
-      const generated = await api.caseBrief(record, briefTarget, hospital, distanceKm(briefTarget.coordinates, hospital.coordinates));
+      const generated = await api.caseBrief(record, briefTarget, hospital, distanceKm(briefTarget.coordinates, hospital.coordinates), Boolean(brief));
       if (briefRequestId.current === requestId) setBrief(generated);
     } catch (error) {
       if (briefRequestId.current === requestId) setBriefError(error instanceof Error ? error.message : 'Unable to generate the case brief.');
@@ -81,7 +82,7 @@ export function CaseDetailModal({ record, cases, outcomes, onClose, onAssign, on
         {closed && <div className="outcome-summary"><Badge tone={record.authorized ? 'green' : 'rose'}>{record.authorized ? 'Authorization obtained' : 'Authorization declined'}</Badge><p>Consent obtained: {record.consent_obtained ? 'Yes' : 'No'}</p>{record.notes && <p>{record.notes}</p>}</div>}
       </div>
       <div className="staff-matcher"><div className="flex justify-between items-start gap-4"><div><h3><Sparkles size={18} className="text-emerald-400" />The right connection</h3><p className="subtle text-xs mt-2">Staff ranked by predicted authorization rate</p></div><Badge tone="green">Model v1.{newCount}</Badge></div>
-        {apiConnected && <section className="case-brief"><div className="case-brief-heading"><div><span className="eyebrow">OPC HANDOFF</span><strong>{record.opc_id ? 'Assigned match' : 'Top available match'}{briefTarget ? ` · ${briefTarget.name}` : ''}</strong></div><button className="button secondary small" disabled={!briefTarget || briefLoading} onClick={() => void generateBrief()}><Sparkles size={13} />{briefLoading ? 'Writing…' : brief ? 'Refresh brief' : 'Generate brief'}</button></div><p className="case-brief-demo-label">{brief ? brief.source === 'groq' ? 'AI4Free · Groq · fictional demo records' : 'Local fallback · AI4Free unavailable' : 'Fictional demo records'}</p>{brief && <>{brief.source_detail && <p role="status" className="case-brief-hint">{brief.source_detail}</p>}<p className="case-brief-copy">{brief.case_brief}</p><div className="case-brief-rationale"><span>Match rationale · {(brief.probability * 100).toFixed(1)}%</span><p>{brief.match_rationale}</p></div></>}{briefError && <p role="alert" className="case-brief-error">{briefError}</p>}</section>}
+        {apiConnected && <section className="case-brief"><div className="case-brief-heading"><div><span className="eyebrow">OPC HANDOFF</span><strong>{record.opc_id ? 'Assigned match' : 'Top available match'}{briefTarget ? ` · ${briefTarget.name}` : ''}</strong></div><button className="button secondary small" disabled={!briefTarget || briefLoading} onClick={() => void generateBrief()}><Sparkles size={13} />{briefLoading ? 'Writing…' : brief ? 'Refresh brief' : 'Generate brief'}</button></div><p className="case-brief-demo-label">{brief ? brief.source === 'groq' ? 'AI4Free · Groq · fictional demo records' : 'Local fallback · AI4Free unavailable' : 'Fictional demo records'}</p>{brief && <>{brief.source_detail && <p role="status" className="case-brief-hint">{brief.source_detail}</p>}<div className="case-brief-copy">{brief.case_brief.split(/\n\s*\n/).map((paragraph, index) => <p key={index}>{paragraph}</p>)}</div>{Boolean(brief.conversation_priorities?.length) && <div className="case-brief-section"><h4>Conversation priorities</h4><ul>{brief.conversation_priorities.map((item, index) => <li key={index}>{item}</li>)}</ul></div>}{Boolean(brief.verify_before_approach?.length) && <div className="case-brief-section"><h4>Confirm before approach</h4><ul>{brief.verify_before_approach.map((item, index) => <li key={index}>{item}</li>)}</ul></div>}<div className="case-brief-rationale"><span>Match rationale · {(brief.probability * 100).toFixed(1)}%</span><p>{brief.match_rationale}</p></div></>}{briefError && <p role="alert" className="case-brief-error">{briefError}</p>}</section>}
         <div className="matcher-key"><span>STAFF / PROXIMITY</span><span>MATCH ESTIMATE</span></div>
         <div className="match-list">{ranked.map((person, i) => {
           const unavailable = busy(person.id), assigned = record.opc_id === person.id;

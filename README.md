@@ -55,7 +55,7 @@ Set `VITE_API_PROXY_TARGET` if FastAPI listens elsewhere. For a separately hoste
 
 ### Case briefs through AI4Free
 
-FastAPI runs AI4Free's Groq provider in the separate Python 3.11 environment `.venv-ai4free`. XGBoost stays in the main `.venv`. The worker loads only AI4Free's Groq module, avoiding its broken imports of unrelated browser providers, and uses its Requests transport rather than urllib. Groq still requires `GROQ_API_KEY`.
+FastAPI runs AI4Free's Groq provider in the separate Python 3.11 environment `.venv-ai4free`. XGBoost stays in the main `.venv`. `ai4free_bridge.py` keeps one worker alive and warms its imports at API startup; the worker reuses its HTTP session between independent cases. The worker loads only AI4Free's Groq module, avoiding its broken imports of unrelated browser providers, and uses its Requests transport rather than urllib. Groq still requires `GROQ_API_KEY`.
 
 To recreate the AI4Free environment:
 
@@ -75,7 +75,9 @@ Shell exports take precedence over `.env`. Set `AI4FREE_PYTHON` to an absolute i
 
 Open `http://localhost:8000/groq/status` to check the same worker, key, and transport used for brief generation. This calls Groq's model metadata endpoint; it verifies authentication and metadata access, while inference can still have separate permissions or limits. A non-JSON 403 can come from a gateway and does not establish that a model is blocked. Provider errors are shown with credentials redacted.
 
-Case details generate a brief and short explanation of the selected XGBoost match on demand. An unavailable provider returns a visibly labeled `local_fallback`; it does not change predictions. The UI labels successful responses as AI4Free · Groq. This integration is for the app's fictional records.
+Case details generate two handoff paragraphs, 2–4 conversation priorities, and 1–3 questions or coordination checks. Inputs describe only documented flags and distinguish unknowns from negative findings. The app composes the match rationale directly from XGBoost contributions and the staff-to-hospital distance, so the LLM cannot invent reasons for a ranking or driving-time estimates.
+
+Successful handoffs are cached in API memory for 10 minutes (up to 64 entries). Identical concurrent requests share generation; changed case details, staff, or model snapshots produce a fresh cache key. **Refresh brief** sends `refresh: true` to bypass the cache. Provider failures and incomplete outputs are never cached. An unavailable provider returns a visibly labeled `local_fallback` with preparation points; it does not change predictions. The UI labels successful responses as AI4Free · Groq. This integration is for the app's fictional records.
 
 ## Python XGBoost API
 
